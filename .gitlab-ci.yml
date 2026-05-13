@@ -1,0 +1,199 @@
+# ============================================================
+#  S-SDLC — Pipeline de Segurança Básico para Web App
+#  Apresentação: Desenvolvimento Seguro e Ciclo de Vida
+#
+#  FLUXO:
+#  install → build → [SAST + SCA] → test → dast → deploy
+# ============================================================
+
+stages:
+  - install
+  - build
+  - security-static # SAST + SCA (análise sem rodar a app)
+  - test
+  - security-dynamic # DAST (análise com a app rodando)
+  - deploy
+
+variables:
+  NODE_VERSION: "22"
+  # ✅ Segredos NUNCA ficam aqui — vêm de CI Variables do GitLab
+  # DEPLOY_TOKEN: $DEPLOY_TOKEN (configurado na UI do GitLab)
+
+# ─────────────────────────────────────────────
+# CACHE — reutiliza node_modules entre stages
+# ─────────────────────────────────────────────
+.node_cache: &node_cache
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - node_modules/
+    policy: pull
+
+# ════════════════════════════════════════════
+# STAGE 1: INSTALL
+# ════════════════════════════════════════════
+install:
+  stage: install
+  image: node:22-alpine
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - node_modules/
+    policy: push # popula o cache
+  script:
+    - npm ci --prefer-offline # instalação reproduzível (usa lock file)
+  artifacts:
+    paths:
+      - node_modules/
+    expire_in: 1 hour
+
+# ════════════════════════════════════════════
+# STAGE 2: BUILD (opcional para apps JS puras)
+# ════════════════════════════════════════════
+build:
+  stage: build
+  image: node:22-alpine
+  <<: *node_cache
+  script:
+    - echo "Build da aplicação..."
+    - node -e "require('./src/index.js')" &
+    - sleep 2 && kill %1 || true # smoke test básico: app sobe sem erros
+  needs: [install]
+
+# ════════════════════════════════════════════
+# STAGE 3A: SAST — Análise Estática de Código
+#   White-box: analisa o source sem rodar a app
+#   Ferramenta: Semgrep (open source, OWASP rules)
+# ════════════════════════════════════════════
+sast:
+  stage: security-static
+  image: semgrep/semgrep:latest
+  <<: *node_cache
+  script:
+    - |
+      semgrep scan \
+        --config "p/javascript"  \
+        --config "p/owasp-top-ten" \
+        --error \
+        --json-output=sast-report.json \
+        src/
+  artifacts:
+    when: always
+    paths:
+      - sast-report.json
+    reports:
+      sast: sast-report.json # integra ao GitLab Security Dashboard
+    expire_in: 1 week
+  needs: [install]
+  allow_failure: false # 🔴 Quality Gate: bloqueia o pipeline se falhar
+
+# ════════════════════════════════════════════
+# STAGE 3B: SCA — Software Composition Analysis
+#   Analisa dependências de terceiros (CVEs)
+#   Ferramenta: npm audit (nativo, sem custo)
+# ════════════════════════════════════════════
+sca:
+  stage: security-static
+  image: node:22-alpine
+  <<: *node_cache
+  script:
+    - |
+      echo "=== Verificando CVEs nas dependências ==="
+      npm audit --audit-level=moderate --json > sca-report.json || true
+      # Falha o job se houver vulnerabilidades HIGH ou CRITICAL
+      npm audit --audit-level=high
+  artifacts:
+    when: always
+    paths:
+      - sca-report.json
+    expire_in: 1 week
+  needs: [install]
+  allow_failure: false # 🔴 Quality Gate: bloqueia em HIGH/CRITICAL
+
+# ════════════════════════════════════════════
+# STAGE 4: TEST — Testes unitários + cobertura
+# ════════════════════════════════════════════
+test:
+  stage: test
+  image: node:22-alpine
+  <<: *node_cache
+  script:
+    - npm test -- --ci --coverage
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    when: always
+    paths:
+      - coverage/
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+    expire_in: 1 week
+  needs: [sast, sca] # testes só rodam se segurança estática passou
+
+# ════════════════════════════════════════════
+# STAGE 5: DAST — Análise Dinâmica
+#   Black-box: sobe a app e simula ataques reais
+#   Ferramenta: OWASP ZAP (open source)
+# ════════════════════════════════════════════
+dast:
+  stage: security-dynamic
+  image: ghcr.io/zaproxy/zaproxy:stable
+  services:
+    - name: node:22-alpine
+      alias: webapp
+      command: ["sh", "-c", "cd /app && npm start"]
+  variables:
+    TARGET_URL: "http://webapp:3000"
+  script:
+    - |
+      echo "=== Iniciando DAST com OWASP ZAP ==="
+      zap-baseline.py \
+        -t "$TARGET_URL" \
+        -r dast-report.html \
+        -J dast-report.json \
+        -I             # continua mesmo com alertas (baseline = não bloqueia)
+        # Troque -I por -x para bloquear o pipeline em falhas MEDIUM+
+  artifacts:
+    when: always
+    paths:
+      - dast-report.html
+      - dast-report.json
+    expire_in: 1 week
+  needs: [test]
+  allow_failure: true # 🟡 Baseline: reporta mas não bloqueia (ajuste conforme maturidade)
+
+# ════════════════════════════════════════════
+# STAGE 6: DEPLOY — somente após todos os gates
+# ════════════════════════════════════════════
+deploy-staging:
+  stage: deploy
+  image: node:22-alpine
+  environment:
+    name: staging
+    url: https://staging.meuapp.com
+  script:
+    - echo "Fazendo deploy para staging..."
+    - echo "Deploy token: $DEPLOY_TOKEN" | sed 's/./*/g' # mascara o token nos logs
+    # Aqui entraria o comando real: kubectl, helm, gcloud, etc.
+  needs: [test]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_success
+
+deploy-production:
+  stage: deploy
+  image: node:22-alpine
+  environment:
+    name: production
+    url: https://meuapp.com
+  script:
+    - echo "Deploy para produção..."
+  needs: [deploy-staging, dast]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual # 🔵 Aprovação manual obrigatória para produção

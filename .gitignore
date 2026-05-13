@@ -1,0 +1,10 @@
+node_modules/
+coverage/
+*.log
+sast-report.json
+sca-report.json
+dast-report.html
+dast-report.json
+.env
+.env.*
+!.env.example
